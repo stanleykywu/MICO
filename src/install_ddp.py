@@ -3,7 +3,7 @@ import urllib
 
 from torchvision.datasets.utils import download_and_extract_archive
 
-url = "https://membershipinference.blob.core.windows.net/mico/ddp.tar.gz?si=ddp&spr=https&sv=2021-06-08&sr=b&sig=wDgcsXhyxAayZ8nd45c75mkkfi%2FuttsyE6cJ8B223Ok%3D" 
+url = "" 
 filename = "ddp.tar.gz"
 md5 = "1b9587c2bdf7867e43fb9da345f395eb"
 

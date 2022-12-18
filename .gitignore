@@ -165,5 +165,5 @@ cython_debug/
 
 # Folders
 tmp/
-starting-kit/cifar10/
-starting-kit/purchase100/
+src/provided_data/
+cifar10/

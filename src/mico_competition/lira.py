@@ -132,9 +132,11 @@ def train_models(
         if ind not in used_indices:
             out_indices.append(ind)
     out_indices = np.array(out_indices)
+    
+    train_size = min(len(out_indices), train_size)
     print(f"There are {len(out_indices)} number of points not used as challenge points")
     print(f"Each shadow model will be trained on: {train_size} points")
-
+    
     shadow_indices = [
         random.choice(
             out_indices,

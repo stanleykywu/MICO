@@ -169,4 +169,5 @@ tunnel.sh
 # Folders
 tmp/
 src/provided_data/
-cifar10/
+src/purchase100/
+src/cifar10/

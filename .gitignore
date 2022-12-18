@@ -163,6 +163,9 @@ cython_debug/
 *.zip
 *.tar.gz
 
+# Connection things
+tunnel.sh
+
 # Folders
 tmp/
 src/provided_data/

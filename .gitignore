@@ -166,6 +166,10 @@ cython_debug/
 # Connection things
 tunnel.sh
 
+# Local DS Store
+.DS_Store
+src/.DS_Store
+
 # Folders
 tmp/
 src/provided_data/

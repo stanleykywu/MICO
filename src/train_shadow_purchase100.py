@@ -4,17 +4,17 @@ import csv
 import os
 
 from tqdm import tqdm
-from mico_competition import ChallengeDataset, load_cifar10, load_model, CNN, train_models, offline_attack
+from mico_competition import ChallengeDataset, load_purchase100, load_model, MLP, train_models, offline_attack
 
-CHALLENGE = "provided_data/cifar10"
+CHALLENGE = "provided_data/purchase100"
 NUM_SHADOW = 30
-LEN_TRAINING = 50000
-INDICE_FILE = "CIFAR10_indice_track.npy"
+LEN_TRAINING = 150000
+INDICE_FILE = "PURCHASE100_indice_track.npy"
 
 scenarios = os.listdir(CHALLENGE)
 phases = ['dev', 'final', 'train']
 
-dataset = load_cifar10()
+dataset = load_purchase100()
 
 if os.path.exists(INDICE_FILE):
     print("Loading indice dictionary...")
@@ -23,13 +23,14 @@ else:
     collisions = 0
     hash_to_ind = {}
     for i, data in tqdm(enumerate(dataset), desc="Verifying hash uniqueness", total=len(dataset)):
-        image_hash = imagehash.phash(transform(data[0]), hash_size=8)
+        image_matrix = data[0].reshape((20, 30))
+        image_hash = imagehash.phash(transform(image_matrix), hash_size=8)
         if image_hash in hash_to_ind:
             collisions += 1
         else:
             hash_to_ind[image_hash] = i
 
-    assert collisions == 0
+    assert collisions < 5
 
     indice_track = {}
 
@@ -46,58 +47,59 @@ else:
                 indice_track[scenario][phase][i] = set()
 
                 for point in challenge_points:
-                    image_hash = imagehash.phash(transform(point[0]), hash_size=8)
+                    image_matrix = point[0].reshape((20, 30))
+                    image_hash = imagehash.phash(transform(image_matrix), hash_size=8)
                     indice_track[scenario][phase][i].add(hash_to_ind[image_hash])
 
     np.save(INDICE_FILE, indice_track)
 
 
-SHADOW_DIRECTORY = "CarliniShadowModels/CNN_MICO_CIFAR"
+SHADOW_DIRECTORY = "CarliniShadowModels/MLP_MICO_PURCHASE"
 parameters = {
-    'cifar10_inf': {
-        "LEN_TRAINING": 50000,
+    'purchase100_inf': {
+        "LEN_TRAINING": 150000,
         "LEN_CHALLENGE": 100,
         "NUM_SHADOW": 30,
-        "LEARNING_RATE": 0.005,
-        "BATCH_SIZE": 32,
-        "EPOCHS": 50,
+        "LEARNING_RATE": 0.001,
+        "BATCH_SIZE": 512,
+        "EPOCHS": 30,
         "MOMENTUM": 0,
         "DEVICE":'cuda',
         "max_physical_batch_size": 128,
-        "lr_scheduler_gamma": 0.96,
-        "lr_scheduler_step": 1,
+        "lr_scheduler_gamma": 0.9,
+        "lr_scheduler_step": 5,
         "secure_mode": False,
     },
-    'cifar10_hi': {
-        "LEN_TRAINING": 50000,
+    'purchase100_hi': {
+        "LEN_TRAINING": 150000,
         "LEN_CHALLENGE": 100,
         "NUM_SHADOW": 30,
-        "LEARNING_RATE": 0.5,
+        "LEARNING_RATE": 0.001,
         "BATCH_SIZE": 512,
-        "EPOCHS": 50,
+        "EPOCHS": 30,
         "MOMENTUM": 0,
         "DEVICE":'cuda',
         "max_physical_batch_size": 128,
-        "lr_scheduler_gamma": 0.96,
-        "lr_scheduler_step": 1,
+        "lr_scheduler_gamma": 0.9,
+        "lr_scheduler_step": 5,
         "secure_mode": True,
         # DP Parameters
         "max_grad_norm": 2.6,
         "target_epsilon": 10.0,
         "target_delta": 1e-5,
     },
-    'cifar10_lo': {
-        "LEN_TRAINING": 50000,
+    'purchase100_lo': {
+        "LEN_TRAINING": 150000,
         "LEN_CHALLENGE": 100,
         "NUM_SHADOW": 30,
-        "LEARNING_RATE": 0.5,
+        "LEARNING_RATE": 0.001,
         "BATCH_SIZE": 512,
-        "EPOCHS": 50,
+        "EPOCHS": 30,
         "MOMENTUM": 0,
         "DEVICE":'cuda',
         "max_physical_batch_size": 128,
-        "lr_scheduler_gamma": 0.96,
-        "lr_scheduler_step": 1,
+        "lr_scheduler_gamma": 0.9,
+        "lr_scheduler_step": 5,
         "secure_mode": True,
         # DP Parameters
         "max_grad_norm": 2.6,
@@ -105,7 +107,7 @@ parameters = {
         "target_delta": 1e-5,
     }
 }
-optimizer = torch.optim.SGD
+optimizer = torch.optim.Adam
 criterion = torch.nn.CrossEntropyLoss()
 
 for scenario in tqdm(scenarios, desc="scenario"):
@@ -116,8 +118,8 @@ for scenario in tqdm(scenarios, desc="scenario"):
             os.mkdir(shadow_folder)
             
         train_models(
-            dataset_name='cifar10',
-            model=CNN(),
+            dataset_name='purchase100',
+            model=MLP(),
             indice_track=indice_track[scenario][phase],
             dataset=dataset,
             train_size=scenario_parameter['LEN_TRAINING'],

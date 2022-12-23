@@ -1,12 +1,20 @@
 import os
 import copy
+import warnings
 
 import numpy as np
 from scipy.stats import norm
-from tqdm.notebook import tqdm
+from tqdm import tqdm, trange
 import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
+from prv_accountant.dpsgd import find_noise_multiplier
+from opacus import PrivacyEngine
+from opacus.validators import ModuleValidator
+import torch.optim as optim
+
+from .modified_training import train_purchase, train_cifar
+from .accountant import PRVAccountant
 
 
 def reset_weights(model):
@@ -26,77 +34,270 @@ def evaluate_accuracy(model, data_loader, device):
         total_correct += (torch.max(outputs, dim=1)[1] == labels).sum()
     return total_correct / len(data_loader.dataset)
 
+def train_shadow_purchase(
+    model,
+    random_sample,
+    criterion,
+    lr,
+    batch_size,
+    epochs,
+    momentum,
+    optimizer,
+    device,
+    dp,
+    lr_scheduler_gamma,
+    lr_scheduler_step,
+    secure_mode,
+    max_grad_norm,
+    target_epsilon,
+    target_delta,
+    max_physical_batch_size,
+):
+    warnings.filterwarnings(action="ignore", module="opacus", message=".*Secure RNG turned off")
+    warnings.filterwarnings(action="ignore", module="torch", message=".*Using a non-full backward hook")
+    assert ModuleValidator.is_valid(model)
+    model.to(device)
+    optimizer = optimizer(model.parameters(), lr=lr)
+
+    # Not the same as batch_size / len(train_dataset)
+    sample_rate = 1 / len(random_sample)
+    num_steps = int(len(random_sample) * epochs)
+
+    if dp:
+        noise_multiplier = find_noise_multiplier(
+            sampling_probability=sample_rate,
+            num_steps=num_steps,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            eps_error=0.1
+        )
+
+        privacy_engine = PrivacyEngine(secure_mode=secure_mode)
+
+        # Override Opacus accountant
+        # Revise if https://github.com/pytorch/opacus/pull/493 is merged
+        privacy_engine.accountant = PRVAccountant(
+            noise_multiplier=noise_multiplier,
+            sample_rate=sample_rate,
+            max_steps=num_steps,
+            eps_error=0.1,
+            delta_error=1e-9)
+
+        model, optimizer, random_sample = privacy_engine.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=random_sample,
+            noise_multiplier=noise_multiplier,
+            max_grad_norm=max_grad_norm,
+            poisson_sampling=True,
+            noise_generator=None,
+        )
+
+        print(f"Training using DP-SGD with {optimizer.original_optimizer.__class__.__name__} optimizer\n"
+             f"  noise multiplier σ = {optimizer.noise_multiplier},\n"
+             f"  clipping norm C = {optimizer.max_grad_norm:},\n"
+             f"  average batch size L = {batch_size},\n"
+             f"  sample rate = {sample_rate},\n"
+             f"  for {epochs} epochs ({num_steps} steps)\n"
+             f"  to target ε = {target_epsilon}, δ = {target_delta}")
+
+        compute_epsilon: Optional[Callable[[float], float]] = lambda delta: privacy_engine.get_epsilon(delta=delta)
+    else:
+        print(f"Training using SGD with {optimizer.__class__.__name__} optimizer\n"
+             f"  batch size L = {batch_size},\n"
+             f"  for {epochs} epochs ({num_steps} steps)")
+        compute_epsilon = None
+
+    # Must be initialized after attaching the privacy engine.
+    # See https://discuss.pytorch.org/t/how-to-use-lr-scheduler-in-opacus/111718
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_scheduler_step, gamma=lr_scheduler_gamma)
+
+    pbar = trange(epochs, desc="Epoch", unit="epoch", position=0, leave=True, disable=None)
+    for epoch in pbar:
+        pbar.set_postfix(lr=f"{scheduler.get_last_lr()}")
+        train_purchase(
+            model=model, 
+            device=device,
+            train_loader=random_sample, 
+            criterion=criterion, 
+            optimizer=optimizer, 
+            epoch=epoch + 1, 
+            batch_size=batch_size,
+            max_physical_batch_size=max_physical_batch_size,
+            dp=dp,
+            compute_epsilon=compute_epsilon
+        )
+        scheduler.step()
+        
+    return model
+
+
+def train_shadow_cifar(
+    model,
+    random_sample,
+    criterion,
+    lr,
+    batch_size,
+    epochs,
+    momentum,
+    optimizer,
+    device,
+    dp,
+    lr_scheduler_gamma,
+    lr_scheduler_step,
+    secure_mode,
+    max_grad_norm,
+    target_epsilon,
+    target_delta,
+    max_physical_batch_size,
+):
+    # Supress warnings
+    warnings.filterwarnings(action="ignore", module="opacus", message=".*Secure RNG turned off")
+    warnings.filterwarnings(action="ignore", module="torch", message=".*Using a non-full backward hook")
+
+    assert ModuleValidator.is_valid(model)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)
+
+    optimizer = optimizer(model.parameters(), lr=lr, momentum=momentum)
+    
+    # Not the same as batch_size / len(train_dataset)
+    sample_rate = 1 / len(random_sample)
+    num_steps = int(len(random_sample) * epochs)
+
+    if dp:
+        noise_multiplier = find_noise_multiplier(
+            sampling_probability=sample_rate,
+            num_steps=num_steps,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            eps_error=0.1
+        )
+
+        privacy_engine = PrivacyEngine(secure_mode=secure_mode)
+
+        # Override Opacus accountant
+        # Revise if https://github.com/pytorch/opacus/pull/493 is merged
+        privacy_engine.accountant = PRVAccountant(
+            noise_multiplier=noise_multiplier,
+            sample_rate=sample_rate,
+            max_steps=num_steps,
+            eps_error=0.1,
+            delta_error=1e-9)
+
+        model, optimizer, random_sample = privacy_engine.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=random_sample,
+            noise_multiplier=noise_multiplier,
+            max_grad_norm=max_grad_norm,
+            poisson_sampling=True,
+            noise_generator=None,
+        )
+
+        print(f"Training using DP-SGD with {optimizer.original_optimizer.__class__.__name__} optimizer\n"
+             f"  noise multiplier σ = {optimizer.noise_multiplier},\n"
+             f"  clipping norm C = {optimizer.max_grad_norm:},\n"
+             f"  average batch size L = {batch_size},\n"
+             f"  sample rate = {sample_rate},\n"
+             f"  for {epochs} epochs ({num_steps} steps)\n"
+             f"  to target ε = {target_epsilon}, δ = {target_delta}")
+
+        compute_epsilon: Optional[Callable[[float], float]] = lambda delta: privacy_engine.get_epsilon(delta=delta)
+    else:
+        print(f"Training using SGD with {optimizer.__class__.__name__} optimizer\n"
+             f"  batch size L = {batch_size},\n"
+             f"  for {epochs} epochs ({num_steps} steps)")
+        compute_epsilon = None
+
+    # Must be initialized after attaching the privacy engine.
+    # See https://discuss.pytorch.org/t/how-to-use-lr-scheduler-in-opacus/111718
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_scheduler_step, gamma=lr_scheduler_gamma)
+
+    pbar = trange(epochs, desc="Epoch", unit="epoch", position=0, leave=True, disable=None)
+    for epoch in pbar:
+        pbar.set_postfix(lr=f"{scheduler.get_last_lr()}")
+        train_cifar(
+            model=model, 
+            device=device,
+            train_loader=random_sample, 
+            criterion=criterion, 
+            optimizer=optimizer, 
+            epoch=epoch + 1, 
+            batch_size=batch_size,
+            max_physical_batch_size=max_physical_batch_size,
+            dp=dp,
+            compute_epsilon=compute_epsilon
+        )
+        scheduler.step()
+        
+    return model
+
 def train_shadow_model(
+    dataset_name,
     model,
     random_sample,
     shadow_model_number,
     criterion,
     lr,
+    batch_size,
     epochs,
     momentum,
-    gamma,
-    scheduler_step,
     optimizer,
     saved_models_dir,
     device,
+    dp,
+    lr_scheduler_gamma,
+    lr_scheduler_step,
+    secure_mode,
+    max_grad_norm,
+    target_epsilon,
+    target_delta,
+    max_physical_batch_size,
 ):
-    """Helper function to train individual shadow models
-
-    Parameters
-    ----------
-        model : PyTorch model
-        random_sample : PyTorch Dataloader
-            The randomly generated dataset to train a single shadow model
-        shadow_model_number : int
-            Which shadow model we are training
-        criterion : torch.nn.Criterion
-            Criterion for training
-        lr : float
-            Learning Rate
-        epochs : int
-            Number of epochs to run
-        Momentum : float
-            Momentum parameter
-        gamma : float
-            Multiplier for learning rate scheduler
-        scheduler_step : int
-            Number of epochs before multiplying learning rate by gamma
-        optimizer : torch.Optimizer
-            Optimizer for torch training
-        device : str
-    """
-    shadow_model = copy.deepcopy(model).to(device)
-    reset_weights(shadow_model)
-
-    opt = optimizer(
-        shadow_model.parameters(), lr=lr, momentum=momentum
-    )
-    scheduler = torch.optim.lr_scheduler.StepLR(opt, scheduler_step, gamma)
-    shadow_model.train()
-    print("\n")
-    print("-" * 8)
-    print("Training Shadow Model...\n")
-    for _ in range(epochs):
-        running_loss = 0
-        for (inputs, labels) in random_sample:
-            opt.zero_grad()
-
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            outputs = shadow_model(inputs)
-
-            loss = criterion(outputs, labels)
-            loss.backward()
-            opt.step()
-
-            running_loss += loss.item() * inputs.size(0)
-        scheduler.step()
-
-    print(
-        f"Shadow Model Final Training Error: {running_loss/len(random_sample.dataset):.4}\n"
-        + f"Shadow Model Final Training Accuracy: {evaluate_accuracy(shadow_model, random_sample, device)*100:.5}%"
-    )
-    print("-" * 8)
+    if dataset_name == "purchase100":
+        shadow_model = train_shadow_purchase(
+            model=model,
+            random_sample=random_sample,
+            criterion=criterion,
+            lr=lr,
+            batch_size=batch_size,
+            epochs=epochs,
+            momentum=momentum,
+            optimizer=optimizer,
+            device=device,
+            dp=dp,
+            lr_scheduler_gamma=lr_scheduler_gamma,
+            lr_scheduler_step=lr_scheduler_step,
+            secure_mode=secure_mode,
+            max_grad_norm=max_grad_norm,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            max_physical_batch_size=max_physical_batch_size,
+        )
+    elif dataset_name == "cifar10":
+        shadow_model = train_shadow_cifar(
+            model=model,
+            random_sample=random_sample,
+            criterion=criterion,
+            lr=lr,
+            batch_size=batch_size,
+            epochs=epochs,
+            momentum=momentum,
+            optimizer=optimizer,
+            device=device,
+            dp=dp,
+            lr_scheduler_gamma=lr_scheduler_gamma,
+            lr_scheduler_step=lr_scheduler_step,
+            secure_mode=secure_mode,
+            max_grad_norm=max_grad_norm,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            max_physical_batch_size=max_physical_batch_size,
+        )
+    else:
+        return ValueError('Invalid dataset')
 
     shadow_model.eval()
     torch.save(
@@ -105,6 +306,7 @@ def train_shadow_model(
     )
 
 def train_models(
+    dataset_name,
     model,
     indice_track,
     dataset,
@@ -116,10 +318,16 @@ def train_models(
     optimizer,
     criterion,
     momentum,
-    gamma,
-    scheduler_step,
     saved_models_dir,
     device,
+    dp,
+    lr_scheduler_gamma,
+    lr_scheduler_step,
+    secure_mode,
+    max_grad_norm,
+    target_epsilon,
+    target_delta,
+    max_physical_batch_size,
     seed=0,
 ):
     random = np.random.RandomState(seed)
@@ -154,18 +362,26 @@ def train_models(
             dataset=training_subset, batch_size=batch_size, shuffle=True
         )
         train_shadow_model(
-            model=model,
+            dataset_name=dataset_name,
+            model=copy.deepcopy(model),
             random_sample=train_loader,
             shadow_model_number=shadow_model + 1,
             criterion=criterion,
             lr=lr,
+            batch_size=batch_size,
             epochs=epochs,
             momentum=momentum,
-            gamma=gamma,
-            scheduler_step=scheduler_step,
             optimizer=optimizer,
             saved_models_dir=saved_models_dir,
             device=device,
+            dp=dp,
+            lr_scheduler_gamma=lr_scheduler_gamma,
+            lr_scheduler_step=lr_scheduler_step,
+            secure_mode=secure_mode,
+            max_grad_norm=max_grad_norm,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            max_physical_batch_size=max_physical_batch_size,
         )
 
 def logit_scaling(p):
@@ -229,6 +445,7 @@ def offline_attack(
     num_shadow_models,
     saved_models_dir,
     device,
+    verbose,
 ):
     """
     Carlini's offline membership inference attack.
@@ -252,7 +469,7 @@ def offline_attack(
     scores = []
 
     for i in tqdm(
-        range(num_shadow_models), desc=f"Computing Out-Distribution Logits"
+        range(num_shadow_models), desc=f"Computing Out-Distribution Logits", disable=not verbose
     ):
         shadow_model = torch.load(
             f"{saved_models_dir}/shadow_model_{i+1}",
@@ -270,7 +487,7 @@ def offline_attack(
         model_confidence(target_model, challenge_points, device)
     )
     for i, shadow_confs in enumerate(
-        tqdm(confs_out, desc="Running Likelihood Estimation")
+        tqdm(confs_out, desc="Running Likelihood Estimation", disable=not verbose)
     ):
         shadow_confs = torch.Tensor(shadow_confs)
         shadow_confs = shadow_confs[torch.isfinite(shadow_confs)]
